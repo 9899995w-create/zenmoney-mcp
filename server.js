@@ -5,7 +5,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 const app = express();
+app.set("trust proxy", true);
+
 app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 const ZENMONEY_TOKEN = process.env.ZENMONEY_TOKEN;
 const MCP_SECRET = process.env.MCP_SECRET;
@@ -13,6 +16,14 @@ const MCP_SECRET = process.env.MCP_SECRET;
 let cachedData = null;
 let cachedAt = 0;
 const CACHE_TTL_MS = 60 * 1000;
+
+const oauthClients = new Map();
+const oauthCodes = new Map();
+const oauthTokens = new Set();
+
+function baseUrl(req) {
+  return `${req.protocol}://${req.get("host")}`;
+}
 
 function nowTs() {
   return Math.floor(Date.now() / 1000);
@@ -153,10 +164,153 @@ function enrichTransactions(data, transactions) {
   }));
 }
 
+/**
+ * OAuth compatibility layer for Claude Desktop / mcp-remote.
+ * Реальная защита остаётся через секретный путь:
+ * /mcp/:secret
+ */
+
+function oauthMetadata(req, res) {
+  const origin = baseUrl(req);
+
+  res.json({
+    issuer: origin,
+    authorization_endpoint: `${origin}/authorize`,
+    token_endpoint: `${origin}/token`,
+    registration_endpoint: `${origin}/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    token_endpoint_auth_methods_supported: [
+      "none",
+      "client_secret_post",
+      "client_secret_basic"
+    ],
+    code_challenge_methods_supported: ["S256", "plain"],
+    scopes_supported: ["mcp"]
+  });
+}
+
+function protectedResourceMetadata(req, res) {
+  const origin = baseUrl(req);
+
+  res.json({
+    resource: `${origin}/mcp`,
+    authorization_servers: [origin],
+    bearer_methods_supported: ["header"],
+    scopes_supported: ["mcp"]
+  });
+}
+
+app.get("/.well-known/oauth-authorization-server", oauthMetadata);
+app.get("/.well-known/oauth-authorization-server/*", oauthMetadata);
+
+app.get("/.well-known/oauth-protected-resource", protectedResourceMetadata);
+app.get("/.well-known/oauth-protected-resource/*", protectedResourceMetadata);
+
+app.post(["/register", "/oauth/register"], (req, res) => {
+  const clientId = `client_${crypto.randomUUID()}`;
+  const clientSecret = `secret_${crypto.randomUUID()}`;
+
+  oauthClients.set(clientId, {
+    clientId,
+    clientSecret,
+    redirectUris: req.body?.redirect_uris || [],
+    createdAt: nowTs()
+  });
+
+  res.status(201).json({
+    client_id: clientId,
+    client_secret: clientSecret,
+    client_id_issued_at: nowTs(),
+    client_secret_expires_at: 0,
+    redirect_uris: req.body?.redirect_uris || [],
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "client_secret_post",
+    scope: "mcp"
+  });
+});
+
+app.get(["/authorize", "/oauth/authorize"], (req, res) => {
+  const redirectUri = req.query.redirect_uri;
+  const state = req.query.state;
+  const clientId = req.query.client_id;
+
+  if (!redirectUri) {
+    return res.status(400).json({
+      error: "invalid_request",
+      error_description: "redirect_uri is required"
+    });
+  }
+
+  const code = `code_${crypto.randomUUID()}`;
+
+  oauthCodes.set(code, {
+    clientId,
+    redirectUri,
+    createdAt: Date.now()
+  });
+
+  const redirect = new URL(String(redirectUri));
+  redirect.searchParams.set("code", code);
+
+  if (state) {
+    redirect.searchParams.set("state", String(state));
+  }
+
+  res.redirect(302, redirect.toString());
+});
+
+app.post(["/token", "/oauth/token"], (req, res) => {
+  const grantType = req.body?.grant_type;
+
+  if (grantType === "authorization_code") {
+    const code = req.body?.code;
+
+    if (!code || !oauthCodes.has(code)) {
+      return res.status(400).json({
+        error: "invalid_grant",
+        error_description: "Invalid authorization code"
+      });
+    }
+
+    oauthCodes.delete(code);
+
+    const accessToken = `token_${crypto.randomUUID()}`;
+    const refreshToken = `refresh_${crypto.randomUUID()}`;
+
+    oauthTokens.add(accessToken);
+
+    return res.json({
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      token_type: "Bearer",
+      expires_in: 3600,
+      scope: "mcp"
+    });
+  }
+
+  if (grantType === "refresh_token") {
+    const accessToken = `token_${crypto.randomUUID()}`;
+    oauthTokens.add(accessToken);
+
+    return res.json({
+      access_token: accessToken,
+      token_type: "Bearer",
+      expires_in: 3600,
+      scope: "mcp"
+    });
+  }
+
+  return res.status(400).json({
+    error: "unsupported_grant_type"
+  });
+});
+
 function createMcpServer() {
   const server = new McpServer({
     name: "zenmoney-mcp",
-    version: "1.0.0"
+    version: "1.1.0"
   });
 
   server.registerTool(
@@ -169,7 +323,8 @@ function createMcpServer() {
       return jsonResult({
         ok: true,
         hasZenmoneyToken: Boolean(ZENMONEY_TOKEN),
-        hasMcpSecret: Boolean(MCP_SECRET)
+        hasMcpSecret: Boolean(MCP_SECRET),
+        oauthShim: true
       });
     }
   );
@@ -257,7 +412,11 @@ function createMcpServer() {
         .filter(t => !categoryId || (Array.isArray(t.tag) && t.tag.includes(categoryId)))
         .filter(t => {
           if (!q) return true;
-          return [t.payee, t.comment, t.id].filter(Boolean).join(" ").toLowerCase().includes(q);
+          return [t.payee, t.comment, t.id]
+            .filter(Boolean)
+            .join(" ")
+            .toLowerCase()
+            .includes(q);
         })
         .sort((a, b) => String(b.date).localeCompare(String(a.date)))
         .slice(0, max);
@@ -324,7 +483,9 @@ function createMcpServer() {
         summary.totalIncome += income;
         summary.totalOutcome += outcome;
 
-        const tagIds = Array.isArray(t.tag) && t.tag.length ? t.tag : ["without_category"];
+        const tagIds = Array.isArray(t.tag) && t.tag.length
+          ? t.tag
+          : ["without_category"];
 
         for (const tagId of tagIds) {
           const title = tagId === "without_category"
@@ -368,7 +529,10 @@ function createMcpServer() {
     },
     async ({ accountId, amount, date, categoryIds, payee, comment, confirm }) => {
       if (!confirm) {
-        return jsonResult({ ok: false, error: "confirm must be true to create expense" });
+        return jsonResult({
+          ok: false,
+          error: "confirm must be true to create expense"
+        });
       }
 
       const data = await getData(true);
@@ -415,7 +579,10 @@ function createMcpServer() {
     },
     async ({ accountId, amount, date, categoryIds, payee, comment, confirm }) => {
       if (!confirm) {
-        return jsonResult({ ok: false, error: "confirm must be true to create income" });
+        return jsonResult({
+          ok: false,
+          error: "confirm must be true to create income"
+        });
       }
 
       const data = await getData(true);
@@ -462,7 +629,10 @@ function createMcpServer() {
     },
     async ({ fromAccountId, toAccountId, outcomeAmount, incomeAmount, date, comment, confirm }) => {
       if (!confirm) {
-        return jsonResult({ ok: false, error: "confirm must be true to create transfer" });
+        return jsonResult({
+          ok: false,
+          error: "confirm must be true to create transfer"
+        });
       }
 
       const data = await getData(true);
@@ -515,7 +685,10 @@ function createMcpServer() {
     },
     async ({ id, date, income, outcome, incomeAccount, outcomeAccount, categoryIds, payee, comment, confirm }) => {
       if (!confirm) {
-        return jsonResult({ ok: false, error: "confirm must be true to update transaction" });
+        return jsonResult({
+          ok: false,
+          error: "confirm must be true to update transaction"
+        });
       }
 
       const data = await getData(true);
@@ -558,7 +731,10 @@ function createMcpServer() {
     },
     async ({ id, categoryIds, confirm }) => {
       if (!confirm) {
-        return jsonResult({ ok: false, error: "confirm must be true to set category" });
+        return jsonResult({
+          ok: false,
+          error: "confirm must be true to set category"
+        });
       }
 
       const data = await getData(true);
@@ -591,7 +767,10 @@ function createMcpServer() {
     },
     async ({ id, confirm }) => {
       if (!confirm) {
-        return jsonResult({ ok: false, error: "confirm must be true to delete transaction" });
+        return jsonResult({
+          ok: false,
+          error: "confirm must be true to delete transaction"
+        });
       }
 
       const data = await getData(true);
@@ -618,11 +797,15 @@ function createMcpServer() {
 
 function checkSecret(req, res, next) {
   if (!MCP_SECRET) {
-    return res.status(500).json({ error: "MCP_SECRET is not configured" });
+    return res.status(500).json({
+      error: "MCP_SECRET is not configured"
+    });
   }
 
   if (req.params.secret !== MCP_SECRET) {
-    return res.status(401).json({ error: "Unauthorized" });
+    return res.status(401).json({
+      error: "Unauthorized"
+    });
   }
 
   next();
@@ -632,6 +815,7 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     service: "zenmoney-mcp",
+    oauthShim: true,
     mcpPath: "/mcp/YOUR_MCP_SECRET",
     tools: [
       "get_health",
@@ -654,7 +838,8 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     hasZenmoneyToken: Boolean(ZENMONEY_TOKEN),
-    hasMcpSecret: Boolean(MCP_SECRET)
+    hasMcpSecret: Boolean(MCP_SECRET),
+    oauthShim: true
   });
 });
 
