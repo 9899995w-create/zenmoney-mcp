@@ -164,12 +164,6 @@ function enrichTransactions(data, transactions) {
   }));
 }
 
-/**
- * OAuth compatibility layer for Claude Desktop / mcp-remote.
- * Реальная защита остаётся через секретный путь:
- * /mcp/:secret
- */
-
 function oauthMetadata(req, res) {
   const origin = baseUrl(req);
 
@@ -310,7 +304,7 @@ app.post(["/token", "/oauth/token"], (req, res) => {
 function createMcpServer() {
   const server = new McpServer({
     name: "zenmoney-mcp",
-    version: "1.1.0"
+    version: "1.2.0"
   });
 
   server.registerTool(
@@ -324,7 +318,8 @@ function createMcpServer() {
         ok: true,
         hasZenmoneyToken: Boolean(ZENMONEY_TOKEN),
         hasMcpSecret: Boolean(MCP_SECRET),
-        oauthShim: true
+        oauthShim: true,
+        bearerAccepted: true
       });
     }
   );
@@ -796,54 +791,29 @@ function createMcpServer() {
 }
 
 function checkSecret(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const bearerToken = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+
+  if (bearerToken && oauthTokens.has(bearerToken)) {
+    return next();
+  }
+
   if (!MCP_SECRET) {
     return res.status(500).json({
       error: "MCP_SECRET is not configured"
     });
   }
 
-  if (req.params.secret !== MCP_SECRET) {
-    return res.status(401).json({
-      error: "Unauthorized"
-    });
+  if (req.params.secret === MCP_SECRET) {
+    return next();
   }
 
-  next();
+  return res.status(401).json({
+    error: "Unauthorized"
+  });
 }
 
-app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "zenmoney-mcp",
-    oauthShim: true,
-    mcpPath: "/mcp/YOUR_MCP_SECRET",
-    tools: [
-      "get_health",
-      "get_accounts",
-      "get_categories",
-      "get_transactions",
-      "get_transaction_by_id",
-      "get_summary",
-      "create_expense",
-      "create_income",
-      "create_transfer",
-      "update_transaction",
-      "set_transaction_category",
-      "delete_transaction"
-    ]
-  });
-});
-
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    hasZenmoneyToken: Boolean(ZENMONEY_TOKEN),
-    hasMcpSecret: Boolean(MCP_SECRET),
-    oauthShim: true
-  });
-});
-
-app.post("/mcp/:secret", checkSecret, async (req, res) => {
+async function handleMcpRequest(req, res) {
   const server = createMcpServer();
 
   try {
@@ -873,6 +843,54 @@ app.post("/mcp/:secret", checkSecret, async (req, res) => {
       });
     }
   }
+}
+
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "zenmoney-mcp",
+    oauthShim: true,
+    bearerAccepted: true,
+    mcpPath: "/mcp/YOUR_MCP_SECRET",
+    tools: [
+      "get_health",
+      "get_accounts",
+      "get_categories",
+      "get_transactions",
+      "get_transaction_by_id",
+      "get_summary",
+      "create_expense",
+      "create_income",
+      "create_transfer",
+      "update_transaction",
+      "set_transaction_category",
+      "delete_transaction"
+    ]
+  });
+});
+
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    hasZenmoneyToken: Boolean(ZENMONEY_TOKEN),
+    hasMcpSecret: Boolean(MCP_SECRET),
+    oauthShim: true,
+    bearerAccepted: true
+  });
+});
+
+app.post("/mcp", checkSecret, handleMcpRequest);
+app.post("/mcp/:secret", checkSecret, handleMcpRequest);
+
+app.get("/mcp", checkSecret, (req, res) => {
+  res.status(405).json({
+    jsonrpc: "2.0",
+    error: {
+      code: -32000,
+      message: "Method not allowed. Use POST Streamable HTTP MCP."
+    },
+    id: null
+  });
 });
 
 app.get("/mcp/:secret", checkSecret, (req, res) => {
@@ -881,6 +899,17 @@ app.get("/mcp/:secret", checkSecret, (req, res) => {
     error: {
       code: -32000,
       message: "Method not allowed. Use POST Streamable HTTP MCP."
+    },
+    id: null
+  });
+});
+
+app.delete("/mcp", checkSecret, (req, res) => {
+  res.status(405).json({
+    jsonrpc: "2.0",
+    error: {
+      code: -32000,
+      message: "Method not allowed."
     },
     id: null
   });
